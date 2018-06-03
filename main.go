@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net"
 	_ "net/http/pprof"
 	"strconv"
 	"strings"
+	"os"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
@@ -18,18 +20,18 @@ const (
 	namespace       = "solr"
 	pidFileHelpText = `Path to Solr pid file.
 
-	If provided, the standard process metrics get exported for the Solr
-	process, prefixed with 'solr_process_...'. The solr_process exporter
-	needs to have read access to files owned by the Solr process. Depends on
-	the availability of /proc.
+        If provided, the standard process metrics get exported for the Solr
+        process, prefixed with 'solr_process_...'. The solr_process exporter
+        needs to have read access to files owned by the Solr process. Depends on
+        the availability of /proc.
 
-	https://prometheus.io/docs/instrumenting/writing_clientlibs/#process-metrics.`
+        https://prometheus.io/docs/instrumenting/writing_clientlibs/#process-metrics.`
 )
 
 var (
-	listenAddress    = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9231").String()
+	listenAddress    = kingpin.Flag("unix-sock", "Address to listen on for unix sock access.").Default("/dev/shm/solr_detail_exporter.sock").String()
 	metricsPath      = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-	solrURI          = kingpin.Flag("solr.address", "URI on which to scrape Solr.").Default("http://localhost:8983").String()
+	solrURI          = kingpin.Flag("solr.address", "URI on which to scrape Solr.").Default("http://localhost:8080").String()
 	solrContextPath  = kingpin.Flag("solr.context-path", "Solr webapp context path.").Default("/solr").String()
 	solrExcludedCore = kingpin.Flag("solr.excluded-core", "Regex to exclude core from monitoring").Default("").String()
 	solrTimeout      = kingpin.Flag("solr.timeout", "Timeout for trying to get stats from Solr.").Default("5s").Duration()
@@ -37,9 +39,9 @@ var (
 )
 
 var landingPage = []byte(`<html>
-<head><title>Solr exporter</title></head>
+<head><title>Solr detail exporter</title></head>
 <body>
-<h1>Solr exporter</h1>
+<h1>Solr detail exporter</h1>
 <p><a href='` + *metricsPath + `'>Metrics</a></p>
 </body>
 </html>
@@ -47,16 +49,13 @@ var landingPage = []byte(`<html>
 
 func main() {
 	log.AddFlags(kingpin.CommandLine)
-	kingpin.Version(version.Print("solr_exporter"))
+	kingpin.Version(version.Print("solr_detail_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
 
-	log.Infoln("Starting solr_exporter", version.Info())
-	log.Infoln("Build context", version.BuildContext())
-
 	exporter := NewExporter(*solrURI, *solrContextPath, *solrTimeout, *solrExcludedCore)
 	prometheus.MustRegister(exporter)
-	prometheus.MustRegister(version.NewCollector("solr_exporter"))
+	prometheus.MustRegister(version.NewCollector("solr_detail_exporter"))
 
 	if *solrPidFile != "" {
 		procExporter := prometheus.NewProcessCollectorPIDFn(
@@ -74,10 +73,19 @@ func main() {
 		prometheus.MustRegister(procExporter)
 	}
 
-	log.Infoln("Listening on", *listenAddress)
-	http.Handle(*metricsPath, prometheus.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle(*metricsPath, prometheus.Handler())
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write(landingPage)
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	server := http.Server{
+		Handler: mux, // http.DefaultServeMux,
+	}
+	os.Remove(*listenAddress)
+
+	listener, err := net.Listen("unix", *listenAddress)
+	if err != nil {
+		panic(err)
+	}
+	server.Serve(listener)
 }
